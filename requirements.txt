@@ -1,5 +1,5 @@
 python-telegram-bot==20.7
-aiohttp
-phonenumbers
-beautifulsoup4
-python-dotenv
+aiohttp==3.9.5
+phonenumbers==8.13.39
+beautifulsoup4==4.12.3
+python-dotenv==1.0.1
