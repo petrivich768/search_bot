@@ -17,11 +17,12 @@ from telegram.ext import (
     ContextTypes, CallbackQueryHandler, ConversationHandler
 )
 
-# Загружаем переменные из .env
 load_dotenv()
 
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-LEAKCHECK_KEY = os.getenv('LEAKCHECK_KEY', '')  # если не задан, будет пустая строка
+LEAKCHECK_KEY = os.getenv('LEAKCHECK_KEY', '')
+DADATA_API_KEY = os.getenv('DADATA_API_KEY')
+DADATA_SECRET_KEY = os.getenv('DADATA_SECRET_KEY')
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не задан! Создайте файл .env и укажите токен.")
@@ -31,7 +32,9 @@ ADMIN_ID = 8359674526
 # Состояния для ConversationHandler
 (CHOOSING, TYPING_NICK, TYPING_TG_USERNAME, TYPING_IP,
  TYPING_GITHUB_USERNAME, TYPING_EMAIL, TYPING_DOMAIN, TYPING_PHONE,
- TYPING_ADMIN_USER_ID, TYPING_ADMIN_AMOUNT) = range(10)
+ TYPING_MNP, TYPING_TIKTOK_USERNAME,
+ TYPING_INN,  # новое состояние
+ TYPING_ADMIN_USER_ID, TYPING_ADMIN_AMOUNT) = range(13)
 
 # ---------- Хранилище лимитов и защиты ----------
 user_limits = {}
@@ -99,12 +102,38 @@ def is_phone(text: str):
     else:
         return cleaned.isdigit() and 8 <= len(cleaned) <= 15
 
+def is_inn(text: str):
+    # Проверка на 10 или 12 цифр
+    return text.isdigit() and len(text) in (10, 12)
+
+# ---------- Вспомогательная функция форматирования в стиле DAMAGE ----------
+def format_dict_as_damage(data_dict: dict, title: str = None, indent: int = 0) -> str:
+    lines = []
+    if title:
+        lines.append(f"\n{title}")
+    for key, value in data_dict.items():
+        if isinstance(value, dict):
+            lines.append(f"{'│' * indent}├{key}:")
+            lines.append(format_dict_as_damage(value, indent=indent+1))
+        elif isinstance(value, list):
+            if value:
+                lines.append(f"{'│' * indent}├{key}:")
+                for item in value[:10]:
+                    lines.append(f"{'│' * (indent+1)}├{item}")
+                if len(value) > 10:
+                    lines.append(f"{'│' * (indent+1)}└... и ещё {len(value)-10}")
+            else:
+                lines.append(f"{'│' * indent}├{key}: нет данных")
+        else:
+            lines.append(f"{'│' * indent}├{key}: {value}")
+    return "\n".join(lines)
+
 # ---------- Поиск по нику (соцсети) ----------
 async def check_social_media(nick: str):
     sites = {
         "Twitter": f"https://twitter.com/{nick}",
         "Instagram": f"https://instagram.com/{nick}",
-        "TikTok": f"https://tiktok.com/@{nick}",
+        "TikTok": f"https://tiktok.com/{nick}",
         "GitHub": f"https://github.com/{nick}",
         "Reddit": f"https://reddit.com/user/{nick}",
         "Pinterest": f"https://pinterest.com/{nick}",
@@ -149,18 +178,19 @@ async def get_ip_info(ip: str):
                 return None, data.get('message', 'Unknown error')
 
 def format_ip_info(data: dict) -> str:
-    lines = [
-        f"IP: {data.get('query')}",
-        f"Страна: {data.get('country')}",
-        f"Регион: {data.get('regionName')}",
-        f"Город: {data.get('city')}",
-        f"Почтовый индекс: {data.get('zip')}",
-        f"Координаты: {data.get('lat')}, {data.get('lon')}",
-        f"Провайдер: {data.get('isp')}",
-        f"Организация: {data.get('org')}",
-        f"AS: {data.get('as')}"
-    ]
-    return '\n'.join(lines)
+    items = {
+        "IP": data.get('query'),
+        "Страна": data.get('country'),
+        "Регион": data.get('regionName'),
+        "Город": data.get('city'),
+        "Почтовый индекс": data.get('zip'),
+        "Координаты": f"{data.get('lat')}, {data.get('lon')}",
+        "Провайдер": data.get('isp'),
+        "Организация": data.get('org'),
+        "AS": data.get('as')
+    }
+    items = {k: v for k, v in items.items() if v}
+    return format_dict_as_damage(items, title="🌐 Информация по IP")
 
 # ---------- Поиск по GitHub (по username) ----------
 async def github_find_info_by_username(username: str):
@@ -178,9 +208,7 @@ async def github_find_info_by_username(username: str):
                 for f in fields:
                     if data.get(f):
                         result[f] = data[f]
-                        output_lines.append(f'[+] {f} : {data[f]}')
                 result['public_gists'] = f'https://gist.github.com/{username}'
-                output_lines.append(f'[+] public_gists : https://gist.github.com/{username}')
             else:
                 return None, "Пользователь не найден или ошибка API"
 
@@ -192,13 +220,13 @@ async def github_find_info_by_username(username: str):
                 gpg_text = await resp.text()
                 if "hasn't uploaded any GPG keys" not in gpg_text:
                     result['GPG_keys'] = gpg_url
-                    output_lines.append(f'[+] GPG_keys : {gpg_url}')
         async with session.get(ssh_url) as resp:
             if resp.status == 200 and await resp.text():
                 result['SSH_keys'] = ssh_url
-                output_lines.append(f'[+] SSH_keys : {ssh_url}')
 
-    return result, output_lines
+    if not result:
+        return None, "Пользователь не найден"
+    return result, None
 
 # ---------- Основные API для email/domain ----------
 HUDSON_URL = "https://cavalier.hudsonrock.com/api/json/v2/osint-tools"
@@ -258,15 +286,13 @@ async def search_duolingo(session, email):
                 data = await resp.json()
                 if data.get('users') and len(data['users']) > 0:
                     user = data['users'][0]
-                    lines = [f"✅ Duolingo"]
-                    lines.append(f"  └──Username: {user.get('username', '?')}")
-                    if user.get('bio'):
-                        lines.append(f"     Bio: {user['bio']}")
-                    if user.get('totalXp'):
-                        lines.append(f"     Total XP: {user['totalXp']}")
-                    if user.get('courses') and len(user['courses']) > 0:
-                        lines.append(f"     From: {user['courses'][0].get('fromLanguage', '?')}")
-                    return "\n".join(lines)
+                    result = {
+                        "Username": user.get('username', '?'),
+                        "Bio": user.get('bio', ''),
+                        "Total XP": user.get('totalXp', 0),
+                        "From": user.get('courses', [{}])[0].get('fromLanguage', '?') if user.get('courses') else '?'
+                    }
+                    return format_dict_as_damage(result, title="✅ Duolingo")
     except Exception:
         pass
     return None
@@ -282,7 +308,7 @@ async def search_gravatar(session, email):
                 if data.get('entry') and len(data['entry']) > 0:
                     display_name = data['entry'][0].get('displayName')
                     if display_name:
-                        return f"✅ Gravatar\n  └──Name: {display_name}"
+                        return format_dict_as_damage({"Name": display_name}, title="✅ Gravatar")
                     else:
                         return "✅ Gravatar"
     except Exception:
@@ -328,7 +354,7 @@ async def search_protonmail(session, email):
                     if match:
                         timestamp = int(match.group(1))
                         date = datetime.utcfromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
-                        return f"✅ ProtonMail (PGP created: {date} UTC)"
+                        return format_dict_as_damage({"PGP created (UTC)": date}, title="✅ ProtonMail")
                     else:
                         return "✅ ProtonMail"
     except Exception:
@@ -362,7 +388,8 @@ async def search_instagram(session, email):
                     username = user_info.get('username')
                     pic = user_info.get('profile_pic_url')
                     if username:
-                        return f"✅ Instagram\n  └──Username: {username}\n  └──Profile pic: {pic}"
+                        result = {"Username": username, "Profile pic": pic}
+                        return format_dict_as_damage(result, title="✅ Instagram")
     except Exception:
         pass
     return None
@@ -392,85 +419,80 @@ async def search_github_email(session, email):
                     if items:
                         login = items[0].get('login')
                         avatar = items[0].get('avatar_url')
-                        return f"✅ GitHub\n  └──Username: {login}\n  └──Avatar: {avatar}"
+                        result = {"Username": login, "Avatar": avatar}
+                        return format_dict_as_damage(result, title="✅ GitHub")
     except Exception:
         pass
     return None
 
-# ---------- Форматирование результатов ----------
+# ---------- Форматирование для Hudson и др. ----------
 def format_hudson_standard(data, search_type, query):
-    if not isinstance(data, dict):
-        return "❌ Информация не найдена"
-    lines = []
-    if "error" in data:
-        return "❌ Информация не найдена"
+    if not isinstance(data, dict) or "error" in data:
+        return None
+    items = {}
     if "message" in data:
-        lines.append(f"ℹ️ {data['message']}")
+        items["Сообщение"] = data['message']
     if "total_corporate_services" in data or "total_user_services" in data:
         corp = data.get('total_corporate_services', 0)
         user = data.get('total_user_services', 0)
-        lines.append(f"Статистика: корп.сервисов {corp}, польз.сервисов {user}")
+        items["Корп.сервисов"] = corp
+        items["Польз.сервисов"] = user
     if "stealers" in data and data["stealers"]:
-        lines.append(f"Найдено зараженных устройств: {len(data['stealers'])}")
+        stealers_list = []
         for i, stealer in enumerate(data["stealers"][:3], 1):
             date = stealer.get('date_compromised', '?')
             ip = stealer.get('ip', '?')
             os = stealer.get('operating_system', '?')
-            lines.append(f"Устройство {i}: {date}, IP {ip}, OS {os}")
+            stealers_list.append(f"Устройство {i}: {date}, IP {ip}, OS {os}")
             if stealer.get("top_logins"):
-                logins = stealer["top_logins"][:3]
-                lines.append(f"  Логины: {', '.join(logins)}")
+                logins = ', '.join(stealer["top_logins"][:3])
+                stealers_list.append(f"  Логины: {logins}")
+        items["Зараженные устройства"] = stealers_list
     else:
-        lines.append("Информация о заражениях не найдена")
-    if not lines:
-        return "❌ Информация не найдена"
-    return "\n".join(lines)
+        items["Зараженные устройства"] = "не найдены"
+    if items:
+        return format_dict_as_damage(items, title="🔍 Hudson Rock")
+    return None
 
 def format_hudson_domain(data, query):
-    if not isinstance(data, dict):
-        return "❌ Информация не найдена"
-    lines = []
-    if "error" in data:
-        return "❌ Информация не найдена"
+    if not isinstance(data, dict) or "error" in data:
+        return None
+    items = {}
     if "total" in data:
-        lines.append(f"Всего записей: {data.get('total', 0)}")
-        lines.append(f"Сотрудников: {data.get('employees', 0)}")
-        lines.append(f"Пользователей: {data.get('users', 0)}")
+        items["Всего записей"] = data.get('total', 0)
+        items["Сотрудников"] = data.get('employees', 0)
+        items["Пользователей"] = data.get('users', 0)
     if "data" in data:
         d = data["data"]
         if d.get("employees_urls"):
-            lines.append(f"Найдено URL сотрудников: {len(d['employees_urls'])}")
+            items["URL сотрудников"] = [u['url'] for u in d['employees_urls'][:5]]
         if d.get("clients_urls"):
-            lines.append(f"Найдено URL клиентов: {len(d['clients_urls'])}")
-    if not lines:
-        return "❌ Информация не найдена"
-    return "\n".join(lines)
+            items["URL клиентов"] = [u['url'] for u in d['clients_urls'][:5]]
+    if items:
+        return format_dict_as_damage(items, title="🔍 Hudson Rock (домен)")
+    return None
 
 def format_leakcheck(data, query):
-    if not isinstance(data, dict):
-        return "❌ Информация не найдена"
-    if "error" in data:
-        return "❌ Информация не найдена"
+    if not isinstance(data, dict) or "error" in data:
+        return None
     if data.get('success'):
         found = data.get('found', 0)
         if found == 0:
-            return "❌ Информация не найдена"
-        lines = [f"✅ LeakCheck: найдено записей: {found}"]
+            return None
+        items = {"Найдено записей": found}
         if data.get('sources'):
-            sources = data['sources'][:10]
-            lines.append("Источники утечек:")
-            for s in sources:
+            sources_list = []
+            for s in data['sources'][:10]:
                 name = s.get('name', '?')
                 date = s.get('date', '?')
-                lines.append(f"• {name} ({date})")
-        return "\n".join(lines)
-    return "❌ Информация не найдена"
+                sources_list.append(f"{name} ({date})")
+            items["Источники"] = sources_list
+        return format_dict_as_damage(items, title="✅ LeakCheck")
+    return None
 
 def format_proxynova(data, query):
-    if not isinstance(data, dict):
-        return "❌ Информация не найдена"
-    if "error" in data:
-        return "❌ Информация не найдена"
+    if not isinstance(data, dict) or "error" in data:
+        return None
     proxies = []
     if 'lines' in data:
         proxies = data['lines']
@@ -479,122 +501,71 @@ def format_proxynova(data, query):
     elif 'results' in data:
         proxies = data['results']
     if proxies:
-        lines = [f"✅ ProxyNova: найдено записей: {len(proxies)}"]
-        for p in proxies[:10]:
-            lines.append(f"• {p}")
-        return "\n".join(lines)
-    return "❌ Информация не найдена"
+        items = {"Найдено записей": len(proxies), "Примеры": proxies[:10]}
+        return format_dict_as_damage(items, title="✅ ProxyNova")
+    return None
 
 def format_psbdmp(data, query, search_type):
-    if not isinstance(data, list):
-        return "❌ Информация не найдена"
-    if data:
-        lines = [f"✅ PSBDmp: найдено паст: {len(data)}"]
-        for p in data[:10]:
-            paste_id = p.get('id', '?')
-            tags = p.get('tags', '?')
-            lines.append(f"• ID: {paste_id} | Теги: {tags}")
-        return "\n".join(lines)
-    return "❌ Информация не найдена"
+    if not isinstance(data, list) or not data:
+        return None
+    items = {"Найдено паст": len(data)}
+    pastes = []
+    for p in data[:10]:
+        paste_id = p.get('id', '?')
+        tags = p.get('tags', '?')
+        pastes.append(f"ID: {paste_id} | Теги: {tags}")
+    items["Пасты"] = pastes
+    return format_dict_as_damage(items, title="✅ PSBDmp")
 
-# ---------- Поиск по номеру телефона ----------
+# ---------- УЛУЧШЕННАЯ ФУНКЦИЯ ПОИСКА ПО НОМЕРУ ----------
 async def get_phone_info(phone: str):
-    clean_phone = re.sub(r'[^0-9]', '', phone)
+    clean_phone = re.sub(r'[^\d+]', '', phone)
     if not clean_phone:
         return None, "❌ Некорректный номер"
 
     async with aiohttp.ClientSession() as session:
-        tasks = [
-            _local_scan(clean_phone),
-            _htmlweb_scan(session, clean_phone),
-            _phoneradar_scan(session, clean_phone),
-            _avito_scan(session, clean_phone),
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        htmlweb_data = await _htmlweb_number_scan(session, clean_phone)
+        phoneradar_rating, phoneradar_link = await _phoneradar_rating(clean_phone)
 
-    local_data, htmlweb_data, phoneradar_data, avito_data = results[:4]
+    if not htmlweb_data or htmlweb_data.get("error"):
+        return None, "❌ Информация не найдена"
 
-    lines = [f"📞 Результаты поиска по номеру {phone}\n"]
+    items = {}
 
-    if local_data and not isinstance(local_data, Exception):
-        lines.append(f"Международный формат: {local_data.get('intl', 'Неизвестно')}")
-        lines.append(f"Код страны: {local_data.get('country_code', 'Неизвестно')}")
-        lines.append(f"Страна: {local_data.get('country', 'Неизвестно')}")
-        lines.append(f"Оператор: {local_data.get('carrier', 'Не найдено')}")
-        if 'timezones' in local_data and local_data['timezones']:
-            tz_list = ', '.join(local_data['timezones'])
-            lines.append(f"Часовые пояса: {tz_list}")
-        lines.append("")
+    # Основные данные
+    if htmlweb_data.get('country'):
+        items["Страна"] = htmlweb_data['country']
+    if htmlweb_data.get('country_code'):
+        items["Код страны"] = htmlweb_data['country_code']
+    if htmlweb_data.get('city'):
+        items["Город"] = htmlweb_data['city']
+    if htmlweb_data.get('postal_code'):
+        items["Почтовый индекс"] = htmlweb_data['postal_code']
+    if htmlweb_data.get('currency_code'):
+        items["Код валюты"] = htmlweb_data['currency_code']
+    if htmlweb_data.get('operator'):
+        oper = htmlweb_data['operator']
+        oper_str = oper.get('brand', '')
+        if oper.get('name'):
+            oper_str += f" ({oper['name']})"
+        if oper.get('url'):
+            oper_str += f" - {oper['url']}"
+        items["Оператор"] = oper_str
+    if htmlweb_data.get('region'):
+        items["Регион"] = htmlweb_data['region']
+    if htmlweb_data.get('district'):
+        items["Округ"] = htmlweb_data['district']
+    if htmlweb_data.get('latitude') and htmlweb_data.get('longitude'):
+        items["Координаты"] = f"{htmlweb_data['latitude']}, {htmlweb_data['longitude']}"
+        items["Карта Google"] = f"https://www.google.com/maps/place/{htmlweb_data['latitude']}+{htmlweb_data['longitude']}"
 
-    if htmlweb_data and not isinstance(htmlweb_data, Exception):
-        lines.append(f"Страна (HTMLWeb): {htmlweb_data.get('country', 'Неизвестно')}")
-        lines.append(f"Код страны: {htmlweb_data.get('country_code', 'Неизвестно')}")
-        if 'length' in htmlweb_data:
-            lines.append(f"Длина номера: {htmlweb_data['length']}")
-        if 'location' in htmlweb_data:
-            lines.append(f"Локация: {htmlweb_data['location']}")
-        if 'language' in htmlweb_data:
-            lines.append(f"Язык: {htmlweb_data['language']}")
-        if 'region' in htmlweb_data:
-            lines.append(f"Область: {htmlweb_data['region']}")
-        if 'district' in htmlweb_data:
-            lines.append(f"Округ: {htmlweb_data['district']}")
-        if 'capital' in htmlweb_data:
-            lines.append(f"Столица: {htmlweb_data['capital']}")
-        if 'capital_code' in htmlweb_data:
-            lines.append(f"Код столицы: {htmlweb_data['capital_code']}")
-        if 'city' in htmlweb_data:
-            lines.append(f"Город: {htmlweb_data['city']}")
-        if 'area' in htmlweb_data:
-            lines.append(f"Район: {htmlweb_data['area']}")
-        if 'operator' in htmlweb_data:
-            lines.append(f"Оператор: {htmlweb_data['operator']}")
-        if 'range' in htmlweb_data:
-            lines.append(f"Диапазон номеров: {htmlweb_data['range']}")
-        lines.append("")
+    # Оценка с phoneradar.ru
+    if phoneradar_rating and phoneradar_rating != "Информация отсутствует":
+        items["Оценка номера"] = f"{phoneradar_rating} ({phoneradar_link})"
 
-    if phoneradar_data and not isinstance(phoneradar_data, Exception):
-        if 'operator' in phoneradar_data:
-            lines.append(f"Оператор (PhoneRadar): {phoneradar_data['operator']}")
-        if 'region' in phoneradar_data:
-            lines.append(f"Регион (PhoneRadar): {phoneradar_data['region']}")
-        lines.append("")
+    return format_dict_as_damage(items, title=f"📞 Результаты по номеру {phone}"), None
 
-    if avito_data and not isinstance(avito_data, Exception):
-        lines.append(f"Avito объявлений: {avito_data.get('count', 0)}")
-        lines.append("")
-
-    lines.append("Социальные сети:")
-    lines.append("├ Instagram: https://www.instagram.com/accounts/password/reset")
-    lines.append("├ ВКонтакте: https://vk.com/restore")
-    lines.append("├ Facebook: https://facebook.com/login/identify/?ctx=recover&ars=royal_blue_bar")
-    lines.append("├ Twitter: https://twitter.com/account/begin_password_reset")
-    lines.append("└ LinkedIn: https://linkedin.com/checkpoint/rp/request-password-reset-submit")
-    lines.append("")
-
-    lines.append("Мессенджеры:")
-    lines.append(f"├ WhatsApp: https://api.whatsapp.com/send?phone={clean_phone}")
-    lines.append(f"├ Viber: viber://add?number={clean_phone}")
-    lines.append(f"└ Skype: skype:{clean_phone}?call")
-
-    return "\n".join(lines), None
-
-async def _local_scan(phone: str):
-    try:
-        parsed = phonenumbers.parse(phone, None)
-        if not phonenumbers.is_valid_number(parsed):
-            return None
-        return {
-            "intl": phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.INTERNATIONAL),
-            "country_code": f"+{parsed.country_code}",
-            "country": geocoder.country_name_for_number(parsed, "ru"),
-            "carrier": carrier.name_for_number(parsed, "ru") or "Не найдено",
-            "timezones": timezone.time_zones_for_number(parsed)
-        }
-    except:
-        return None
-
-async def _htmlweb_scan(session, phone: str):
+async def _htmlweb_number_scan(session, phone: str):
     try:
         url = f"https://htmlweb.ru/geo/api.php?json&telcod={phone}"
         async with session.get(url, timeout=10) as resp:
@@ -603,64 +574,214 @@ async def _htmlweb_scan(session, phone: str):
                     data = await resp.json()
                 except json.JSONDecodeError:
                     return None
-                if 'error' in data:
+                if data.get('error'):
                     return None
                 result = {}
                 if 'country' in data:
-                    result['country'] = data['country'].get('name', 'Неизвестно')
+                    result['country'] = data['country'].get('name', '')
                     result['country_code'] = data['country'].get('iso', '')
+                    result['currency_code'] = data['country'].get('iso', '')
                 if '0' in data:
-                    result['operator'] = data['0'].get('oper', '')
-                    result['range'] = data['0'].get('range', '')
+                    result['operator'] = {
+                        'brand': data['0'].get('oper_brand', ''),
+                        'name': data['0'].get('oper', ''),
+                        'url': data['0'].get('url', '')
+                    }
+                    result['city'] = data['0'].get('name', '')
+                    result['postal_code'] = data['0'].get('post', '')
+                    result['latitude'] = data['0'].get('latitude', '')
+                    result['longitude'] = data['0'].get('longitude', '')
                 if 'region' in data:
                     result['region'] = data['region'].get('name', '')
                     if 'okrug' in data['region']:
                         result['district'] = data['region']['okrug']
-                if 'city' in data:
-                    result['city'] = data['city'].get('name', '')
                 if 'capital' in data:
                     result['capital'] = data['capital'].get('name', '')
-                    if 'code' in data['capital']:
-                        result['capital_code'] = data['capital']['code']
-                result['length'] = data.get('length', '')
-                result['location'] = data.get('location', '')
-                result['language'] = data.get('language', '')
                 return result
     except Exception:
         return None
 
-async def _phoneradar_scan(session, phone: str):
+async def _phoneradar_rating(phone: str):
+    clean_phone = re.sub(r'[^0-9]', '', phone)
+    url = f"https://phoneradar.ru/phone/{clean_phone}"
+    headers = {'User-Agent': 'Mozilla/5.0'}
     try:
-        url = f"https://phoneradar.ru/phone/{phone}"
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        async with session.get(url, headers=headers, timeout=10) as resp:
-            if resp.status == 200:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=10) as resp:
+                if resp.status == 200:
+                    html = await resp.text()
+                    soup = BeautifulSoup(html, 'html.parser')
+                    target_block = soup.find('a', href=f"/phone/{clean_phone[1:]}")
+                    if target_block:
+                        card_body = target_block.find_parent('div', class_='card-body')
+                        if card_body:
+                            comment = card_body.find('p').text.strip()
+                            name = card_body.find('p').find_next().find_next().text
+                            return f"{comment} / {name}", url
+    except Exception:
+        pass
+    return "Информация отсутствует", url
+
+# ---------- ПОИСК MNP ----------
+async def get_mnp_info(phone: str):
+    clean_phone = re.sub(r'[^\d+]', '', phone)
+    if not clean_phone:
+        return None, "❌ Некорректный номер"
+    url = f"https://htmlweb.ru/json/mnp/phone/{clean_phone}"
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=10) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get('error'):
+                        return None, "❌ Данные не найдены"
+                    items = {}
+                    if 'city' in data:
+                        items["Город регистрации"] = data['city']
+                    if 'region' in data:
+                        region = data['region']
+                        items["Регион"] = region.get('name', '')
+                        if 'okrug' in region:
+                            items["Округ"] = region['okrug']
+                        if 'autocod' in region:
+                            items["Авто-коды"] = region['autocod']
+                    if 'oper' in data:
+                        oper = data['oper']
+                        oper_str = oper.get('brand', '')
+                        if oper.get('name'):
+                            oper_str += f" ({oper['name']})"
+                        if oper.get('url'):
+                            oper_str += f" - {oper['url']}"
+                        items["Оператор"] = oper_str
+                    return format_dict_as_damage(items, title=f"📡 MNP для номера {phone}"), None
+                else:
+                    return None, "❌ Ошибка API"
+    except Exception as e:
+        return None, f"❌ Ошибка: {e}"
+
+# ---------- ПОИСК ПО TIKTOK ----------
+async def get_tiktok_info(username: str):
+    clean_username = username.lstrip('@')
+    url = f"https://www.tiktok.com/@{clean_username}"
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=15) as resp:
+                if resp.status != 200:
+                    return None
                 html = await resp.text()
                 soup = BeautifulSoup(html, 'html.parser')
-                result = {}
-                info = soup.find('div', class_='phone-info')
-                if info:
-                    lines = info.get_text('\n').split('\n')
-                    for line in lines:
-                        if 'Оператор' in line:
-                            result['operator'] = line.split(':')[-1].strip()
-                        if 'Регион' in line:
-                            result['region'] = line.split(':')[-1].strip()
-                return result
+                script_tag = soup.find('script', attrs={'type': 'application/json', 'crossorigin': 'anonymous'})
+                if not script_tag:
+                    return None
+                data = json.loads(script_tag.string)
+                user_info = data['props']['pageProps']['userInfo']['user']
+                stats = data['props']['pageProps']['userInfo']['stats']
+                items = {
+                    "UserID": user_info['id'],
+                    "Username": user_info['uniqueId'],
+                    "Nickname": user_info['nickname'],
+                    "Bio": user_info.get('signature', ''),
+                    "Profile image": user_info['avatarLarger'],
+                    "Following": stats['followingCount'],
+                    "Followers": stats['followerCount'],
+                    "Likes": stats['heart'],
+                    "Videos": stats['videoCount'],
+                    "Verified": "Да" if user_info.get('verified') else "Нет"
+                }
+                return format_dict_as_damage(items, title="🎵 TikTok профиль")
     except Exception:
         return None
 
-async def _avito_scan(session, phone: str):
+# ---------- НОВАЯ ФУНКЦИЯ: ПОИСК ПО ИНН (DaData) ----------
+async def get_inn_info(inn: str):
+    """Получает информацию об организации или ИП по ИНН через DaData API"""
+    if not DADATA_API_KEY or not DADATA_SECRET_KEY:
+        return None, "❌ API-ключи DaData не настроены. Добавьте их в файл .env"
+
+    url = "https://suggestions.dadata.ru/suggestions/api/4_1/rs/findById/party"
+    headers = {
+        "Authorization": f"Token {DADATA_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+    data = {"query": inn}
     try:
-        url = f"https://mirror.redlime.space/search_by_phone/{phone}"
-        async with session.get(url, timeout=10) as resp:
-            if resp.status == 200:
-                html = await resp.text()
-                soup = BeautifulSoup(html, 'html.parser')
-                ads = soup.find_all('div', class_='item') if soup else []
-                return {"count": len(ads)}
-    except Exception:
-        return None
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=data, headers=headers, timeout=10) as resp:
+                if resp.status == 200:
+                    result = await resp.json()
+                    if not result.get("suggestions"):
+                        return None, "❌ Организация с таким ИНН не найдена"
+
+                    # Берём первое предложение (обычно оно одно)
+                    suggestion = result["suggestions"][0]["data"]
+
+                    # Формируем словарь с данными
+                    items = {}
+
+                    # Наименование
+                    if suggestion.get("name", {}).get("short_with_opf"):
+                        items["Наименование"] = suggestion["name"]["short_with_opf"]
+                    elif suggestion.get("name", {}).get("full_with_opf"):
+                        items["Наименование"] = suggestion["name"]["full_with_opf"]
+
+                    # ИНН/КПП
+                    if suggestion.get("inn"):
+                        items["ИНН"] = suggestion["inn"]
+                    if suggestion.get("kpp"):
+                        items["КПП"] = suggestion["kpp"]
+
+                    # ОГРН
+                    if suggestion.get("ogrn"):
+                        items["ОГРН"] = suggestion["ogrn"]
+                    if suggestion.get("ogrn_date"):
+                        items["Дата ОГРН"] = suggestion["ogrn_date"]
+
+                    # Статус
+                    if suggestion.get("state"):
+                        state = suggestion["state"]
+                        items["Статус"] = state.get("status", "Н/Д")
+                        if state.get("liquidation_date"):
+                            items["Дата ликвидации"] = state["liquidation_date"]
+
+                    # Адрес
+                    if suggestion.get("address", {}).get("unrestricted_value"):
+                        items["Адрес"] = suggestion["address"]["unrestricted_value"]
+
+                    # Координаты
+                    if suggestion.get("address", {}).get("data", {}).get("geo_lat"):
+                        lat = suggestion["address"]["data"]["geo_lat"]
+                        lon = suggestion["address"]["data"]["geo_lon"]
+                        items["Координаты"] = f"{lat}, {lon}"
+                        items["Карта"] = f"https://yandex.ru/maps/?ll={lon},{lat}&z=16"
+
+                    # ОКВЭД
+                    if suggestion.get("okved"):
+                        items["Основной ОКВЭД"] = suggestion["okved"]
+
+                    # Руководитель
+                    if suggestion.get("management", {}).get("name"):
+                        items["Руководитель"] = suggestion["management"]["name"]
+
+                    # Количество филиалов
+                    if suggestion.get("branch_count") is not None:
+                        items["Филиалов"] = suggestion["branch_count"]
+
+                    # Тип (ЮЛ или ИП)
+                    if suggestion.get("type") == "LEGAL":
+                        items["Тип"] = "Юридическое лицо"
+                    elif suggestion.get("type") == "INDIVIDUAL":
+                        items["Тип"] = "Индивидуальный предприниматель"
+
+                    return format_dict_as_damage(items, title=f"📋 Данные по ИНН {inn}"), None
+                else:
+                    return None, f"❌ Ошибка DaData API: {resp.status}"
+    except asyncio.TimeoutError:
+        return None, "❌ Таймаут при запросе к DaData"
+    except Exception as e:
+        return None, f"❌ Ошибка: {e}"
 
 # ---------- Профиль пользователя ----------
 def get_profile_info(user_id: int) -> str:
@@ -735,6 +856,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📧 Поиск по email", callback_data="email")],
         [InlineKeyboardButton("🌍 Поиск по домену", callback_data="domain")],
         [InlineKeyboardButton("📞 Поиск по номеру телефона", callback_data="phone")],
+        [InlineKeyboardButton("🔄 Поиск MNP", callback_data="mnp")],
+        [InlineKeyboardButton("🎵 TikTok по username", callback_data="tiktok")],
+        [InlineKeyboardButton("🔎 Поиск по ИНН", callback_data="inn")],  # новая кнопка
         [InlineKeyboardButton("👤 Мой профиль", callback_data="profile")],
     ]
     if user_id == ADMIN_ID:
@@ -773,6 +897,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "phone":
         await query.edit_message_text("Введите номер телефона в международном формате (например, +79123456789 или 79123456789):")
         return TYPING_PHONE
+    elif action == "mnp":
+        await query.edit_message_text("Введите номер телефона для MNP-поиска (например, +79123456789):")
+        return TYPING_MNP
+    elif action == "tiktok":
+        await query.edit_message_text("Введите username TikTok (можно с @ или без):")
+        return TYPING_TIKTOK_USERNAME
+    elif action == "inn":
+        await query.edit_message_text("Введите ИНН (10 или 12 цифр):")
+        return TYPING_INN
     elif action == "profile":
         info = get_profile_info(user_id)
         await query.message.reply_text(info, parse_mode='Markdown')
@@ -827,28 +960,13 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"🔍 Ищу профили с ником '{text}'...")
             found = await check_social_media(text)
             if found:
-                lines = [f"Найдены профили для '{text}':"]
-                for name, url in found:
-                    lines.append(f"• {name}: {url}")
-                full = '\n'.join(lines)
-                if len(full) <= 4096:
-                    await update.message.reply_text(full)
+                items = {name: url for name, url in found}
+                result = format_dict_as_damage(items, title=f"🔍 Найдены профили для '{text}'")
+                if len(result) <= 4096:
+                    await update.message.reply_text(result)
                 else:
-                    parts = []
-                    current = ""
-                    for line in lines:
-                        if len(current) + len(line) + 1 > 4096:
-                            parts.append(current)
-                            current = line
-                        else:
-                            if current:
-                                current += "\n" + line
-                            else:
-                                current = line
-                    if current:
-                        parts.append(current)
-                    for part in parts:
-                        await update.message.reply_text(part)
+                    for i in range(0, len(result), 4096):
+                        await update.message.reply_text(result[i:i+4096])
             else:
                 await update.message.reply_text("❌ Информация не найдена")
 
@@ -872,12 +990,12 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif action == "github_user":
             await update.message.reply_text(f"⏳ Ищу информацию о пользователе GitHub '{text}'...")
-            result, output = await github_find_info_by_username(text)
-            if result is None:
+            result, err = await github_find_info_by_username(text)
+            if err or not result:
                 await update.message.reply_text("❌ Информация не найдена")
             else:
-                for line in output:
-                    await update.message.reply_text(line)
+                info = format_dict_as_damage(result, title=f"🐙 GitHub: {text}")
+                await update.message.reply_text(info)
 
         elif action == "email":
             if not is_email(text):
@@ -905,21 +1023,7 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             hudson, leakcheck, proxynova, psbdmp, duolingo, gravatar, imgur, mailru, protonmail, bitmoji, instagram, twitter, github = results[:13]
 
             result_parts = []
-
-            hudson_text = format_hudson_standard(hudson, "email", text)
-            if hudson_text and "❌" not in hudson_text:
-                result_parts.append(hudson_text)
-            leakcheck_text = format_leakcheck(leakcheck, text)
-            if leakcheck_text and "❌" not in leakcheck_text:
-                result_parts.append(leakcheck_text)
-            proxynova_text = format_proxynova(proxynova, text)
-            if proxynova_text and "❌" not in proxynova_text:
-                result_parts.append(proxynova_text)
-            psbdmp_text = format_psbdmp(psbdmp, text, "email")
-            if psbdmp_text and "❌" not in psbdmp_text:
-                result_parts.append(psbdmp_text)
-
-            for res in [duolingo, gravatar, imgur, mailru, protonmail, bitmoji, instagram, twitter, github]:
+            for res in [hudson, leakcheck, proxynova, psbdmp, duolingo, gravatar, imgur, mailru, protonmail, bitmoji, instagram, twitter, github]:
                 if res and isinstance(res, str) and not res.startswith("❌"):
                     result_parts.append(res)
 
@@ -949,15 +1053,9 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             hudson, leakcheck, psbdmp = results[:3]
 
             result_parts = []
-            hudson_text = format_hudson_domain(hudson, text)
-            if hudson_text and "❌" not in hudson_text:
-                result_parts.append(hudson_text)
-            leakcheck_text = format_leakcheck(leakcheck, text)
-            if leakcheck_text and "❌" not in leakcheck_text:
-                result_parts.append(leakcheck_text)
-            psbdmp_text = format_psbdmp(psbdmp, text, "domain")
-            if psbdmp_text and "❌" not in psbdmp_text:
-                result_parts.append(psbdmp_text)
+            for res in [hudson, leakcheck, psbdmp]:
+                if res and isinstance(res, str) and not res.startswith("❌"):
+                    result_parts.append(res)
 
             if not result_parts:
                 await update.message.reply_text("❌ Информация не найдена")
@@ -978,6 +1076,48 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             info, err = await get_phone_info(text)
             if err:
                 await update.message.reply_text("❌ Информация не найдена")
+            else:
+                if len(info) <= 4096:
+                    await update.message.reply_text(info, parse_mode='Markdown')
+                else:
+                    for i in range(0, len(info), 4096):
+                        await update.message.reply_text(info[i:i+4096], parse_mode='Markdown')
+
+        elif action == "mnp":
+            if not is_phone(text):
+                await update.message.reply_text("❌ Некорректный номер. Используйте международный формат, например +79123456789")
+                return TYPING_MNP
+            await update.message.reply_text(f"⏳ Ищу MNP для номера {text}...")
+            info, err = await get_mnp_info(text)
+            if err:
+                await update.message.reply_text(err)
+            else:
+                if len(info) <= 4096:
+                    await update.message.reply_text(info, parse_mode='Markdown')
+                else:
+                    for i in range(0, len(info), 4096):
+                        await update.message.reply_text(info[i:i+4096], parse_mode='Markdown')
+
+        elif action == "tiktok":
+            await update.message.reply_text(f"⏳ Ищу информацию о TikTok пользователе @{text.lstrip('@')}...")
+            result = await get_tiktok_info(text)
+            if not result:
+                await update.message.reply_text("❌ Информация не найдена")
+            else:
+                if len(result) <= 4096:
+                    await update.message.reply_text(result, parse_mode='Markdown', disable_web_page_preview=True)
+                else:
+                    for i in range(0, len(result), 4096):
+                        await update.message.reply_text(result[i:i+4096], parse_mode='Markdown', disable_web_page_preview=True)
+
+        elif action == "inn":
+            if not is_inn(text):
+                await update.message.reply_text("❌ ИНН должен содержать 10 или 12 цифр. Попробуйте снова.")
+                return TYPING_INN
+            await update.message.reply_text(f"⏳ Ищу информацию по ИНН {text}...")
+            info, err = await get_inn_info(text)
+            if err:
+                await update.message.reply_text(err)
             else:
                 if len(info) <= 4096:
                     await update.message.reply_text(info, parse_mode='Markdown')
@@ -1022,13 +1162,16 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def return_to_menu(update: Update):
     user_id = update.effective_user.id
     keyboard = [
-        [InlineKeyboardButton("🔍 Поиск по нику (соцсети)", callback_data="nick")],
-        [InlineKeyboardButton("🆔 Telegram ID по юзернейму", callback_data="tgid")],
+        [InlineKeyboardButton("🔍 Поиск по нику", callback_data="nick")],
+        [InlineKeyboardButton("🆔 Telegram ID по username", callback_data="tgid")],
         [InlineKeyboardButton("🌐 Информация по IP", callback_data="ip")],
         [InlineKeyboardButton("🐙 GitHub по username", callback_data="github_user")],
-        [InlineKeyboardButton("📧 Поиск по email (утечки)", callback_data="email")],
+        [InlineKeyboardButton("📧 Поиск по email", callback_data="email")],
         [InlineKeyboardButton("🌍 Поиск по домену", callback_data="domain")],
         [InlineKeyboardButton("📞 Поиск по номеру телефона", callback_data="phone")],
+        [InlineKeyboardButton("🔄 Поиск MNP", callback_data="mnp")],
+        [InlineKeyboardButton("🎵 TikTok по username", callback_data="tiktok")],
+        [InlineKeyboardButton("🔎 Поиск по ИНН", callback_data="inn")],
         [InlineKeyboardButton("👤 Мой профиль", callback_data="profile")],
     ]
     if user_id == ADMIN_ID:
@@ -1050,7 +1193,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Искать данные пользователя GitHub по username\n"
         "• Искать по email (множество источников)\n"
         "• Искать информацию по домену\n"
-        "• Анализировать номер телефона (страна, регион, оператор, часовые пояса, данные с HTMLWeb и PhoneRadar, Avito, соцсети, мессенджеры)\n"
+        "• Анализировать номер телефона (подробно: страна, регион, оператор, координаты, карта, оценка с phoneradar.ru)\n"
+        "• Искать MNP (переносимость номера) – регион, оператор, авто-коды\n"
+        "• Искать информацию о пользователе TikTok\n"
+        "• Искать информацию об организации или ИП по ИНН (через DaData)\n"
         "• Показать мой профиль и остаток запросов (/profile)\n\n"
         f"Лимит: бесплатные {MAX_REQUESTS_PER_DAY} запроса в день.\n\n"
         "Используй кнопки в меню или просто отправь ник, @username, IP, email, домен или номер."
@@ -1075,6 +1221,9 @@ def main():
             TYPING_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_input)],
             TYPING_DOMAIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_input)],
             TYPING_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_input)],
+            TYPING_MNP: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_input)],
+            TYPING_TIKTOK_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_input)],
+            TYPING_INN: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_input)],
             TYPING_ADMIN_USER_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_input)],
             TYPING_ADMIN_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_input)],
         },
@@ -1087,7 +1236,7 @@ def main():
     application.add_handler(CommandHandler('profile', profile_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_input))
 
-    print("Бот запущен и готов к работе (используется .env)")
+    print("Бот запущен и готов к работе (с поиском по ИНН)")
     application.run_polling()
 
 if __name__ == '__main__':
